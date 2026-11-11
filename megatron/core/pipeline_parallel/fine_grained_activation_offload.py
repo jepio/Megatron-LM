@@ -1096,9 +1096,26 @@ class ChunkOffloadHandler:
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque] = defaultdict(deque)
+        # GPU sources of enqueued D2H copies, kept referenced until the current stream has
+        # waited on their group's offload event. record_stream() cannot protect storage the
+        # caching allocator did not allocate (e.g. TE bulk_allocate from_blob views), so
+        # dropping the last reference earlier lets the allocator hand that memory to new
+        # current-stream work while the D2H copy is still pending.
+        self._unjoined_offload_sources = []
+
+    def _join_offloaded_sources(self):
+        """Order the current stream after pending D2H copies, then release their sources."""
+        if not self._unjoined_offload_sources:
+            return
+        if not is_graph_capturing():
+            current_stream = torch.cuda.current_stream()
+            for offload_event, _ in self._unjoined_offload_sources:
+                current_stream.wait_event(offload_event)
+        self._unjoined_offload_sources.clear()
 
     def reset(self):
         """Reset the chunk offload handler."""
+        self._join_offloaded_sources()
         self._offloaded_group_index = 0
         self._groups_to_offload = []
         self._groups_to_reload = []
@@ -1175,6 +1192,7 @@ class ChunkOffloadHandler:
 
     def tensor_pop(self, tensor_tag):
         """Pop tensor from the offload handler."""
+        self._join_offloaded_sources()
         if isinstance(tensor_tag, torch.Tensor):
             debug_rank(f"--------tensor_pop passthrough tensor {tensor_tag.shape}")
             return tensor_tag
@@ -1208,6 +1226,8 @@ class ChunkOffloadHandler:
     def bulk_offload_group(self, group_to_offload):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
+        self._join_offloaded_sources()
+        offloaded_sources = []
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
@@ -1223,8 +1243,13 @@ class ChunkOffloadHandler:
                     # record_stream on the view marks the shared storage
                     # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
+                    offloaded_sources.append(tensor_on_device)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
+        if offloaded_sources:
+            self._unjoined_offload_sources.append(
+                (group_to_offload._offload_event, offloaded_sources)
+            )
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
         # events; optional max-inflight enqueues each group's offload event and
@@ -1298,6 +1323,7 @@ class ChunkOffloadHandler:
         event; the consumer waits for the group's reload event before its first use.
         """
         debug_rank("----bulk_reload_group")
+        self._join_offloaded_sources()
         group_to_reload = self._groups_to_reload[-1]
         # GPU-resident or already-consumed groups still occupy a reload slot.
         # Consume only this slot: skipping ahead to the next CPU-backed group
@@ -1448,6 +1474,7 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank("--on_group_commit_backward")
+        self._join_offloaded_sources()
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         # Switch to this chunk if it's not already current
         if cur_backward_chunk is not self:
@@ -1494,6 +1521,7 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
+        self._join_offloaded_sources()
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         # The forward-start marker runs after this group's internal backward.
         # At backward entry, a GPU-resident final group may still have its slot
