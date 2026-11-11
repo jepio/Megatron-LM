@@ -1096,22 +1096,32 @@ class ChunkOffloadHandler:
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque] = defaultdict(deque)
-        # GPU sources of enqueued D2H copies, kept referenced until the current stream has
-        # waited on their group's offload event. record_stream() cannot protect storage the
-        # caching allocator did not allocate (e.g. TE bulk_allocate from_blob views), so
-        # dropping the last reference earlier lets the allocator hand that memory to new
-        # current-stream work while the D2H copy is still pending.
+        # GPU sources of enqueued D2H copies, kept referenced until their group's offload
+        # event has completed or the current stream has waited on it. record_stream() cannot
+        # protect storage the caching allocator did not allocate (e.g. TE bulk_allocate
+        # from_blob views), so dropping the last reference earlier lets the allocator hand
+        # that memory to new current-stream work while the D2H copy is still pending.
         self._unjoined_offload_sources = []
 
-    def _join_offloaded_sources(self):
-        """Order the current stream after pending D2H copies, then release their sources."""
+    def _join_offloaded_sources(self, wait: bool = True):
+        """Release GPU sources whose D2H copy has completed. With ``wait``, first order the
+        current stream after the remaining copies and release everything."""
         if not self._unjoined_offload_sources:
             return
-        if not is_graph_capturing():
-            current_stream = torch.cuda.current_stream()
-            for offload_event, _ in self._unjoined_offload_sources:
+        if is_graph_capturing():
+            if wait:
+                self._unjoined_offload_sources.clear()
+            return
+        current_stream = torch.cuda.current_stream()
+        pending = []
+        for offload_event, sources in self._unjoined_offload_sources:
+            if offload_event.query():
+                continue
+            if wait:
                 current_stream.wait_event(offload_event)
-        self._unjoined_offload_sources.clear()
+            else:
+                pending.append((offload_event, sources))
+        self._unjoined_offload_sources = pending
 
     def reset(self):
         """Reset the chunk offload handler."""
@@ -1226,7 +1236,7 @@ class ChunkOffloadHandler:
     def bulk_offload_group(self, group_to_offload):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
-        self._join_offloaded_sources()
+        self._join_offloaded_sources(wait=False)
         offloaded_sources = []
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
